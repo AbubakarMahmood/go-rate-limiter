@@ -1,6 +1,8 @@
 module github.com/AbubakarMahmood1/go-rate-limiter
 
-go 1.23
+go 1.23.0
+
+toolchain go1.24.7
 
 require (
 	github.com/gin-gonic/gin v1.11.0
