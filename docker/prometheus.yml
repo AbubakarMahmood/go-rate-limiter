@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'rate-limiter-monitor'
+
+scrape_configs:
+  - job_name: 'rate-limiter'
+    static_configs:
+      - targets: ['rate-limiter:8080']
+        labels:
+          service: 'rate-limiter'
+          environment: 'development'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
