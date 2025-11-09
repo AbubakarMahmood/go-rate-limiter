@@ -1,0 +1,46 @@
+server:
+  port: 8080
+  read_timeout: 5s
+  write_timeout: 10s
+  idle_timeout: 120s
+
+redis:
+  addresses:
+    - localhost:6379
+  password: ""
+  db: 0
+  pool_size: 100
+  ttl: 24h
+
+algorithms:
+  default: token_bucket
+
+limits:
+  default:
+    requests: 100
+    window: 1m
+    burst: 120
+
+  tiers:
+    free:
+      requests: 100
+      window: 1h
+      burst: 120
+
+    premium:
+      requests: 10000
+      window: 1h
+      burst: 12000
+
+    enterprise:
+      requests: 100000
+      window: 1h
+      burst: 120000
+
+metrics:
+  enabled: true
+  path: /metrics
+  port: 8080
+
+# Store type: "memory" or "redis"
+store: memory
