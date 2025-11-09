@@ -96,7 +96,7 @@ function Docker-Up {
     Invoke-Expression "$DockerCompose up -d"
     Write-Host ""
     Write-Host "Services available at:" -ForegroundColor Cyan
-    Write-Host "  - Rate Limiter: http://localhost:8080" -ForegroundColor Yellow
+    Write-Host "  - Rate Limiter: http://localhost:8081" -ForegroundColor Yellow
     Write-Host "  - Prometheus:   http://localhost:9090" -ForegroundColor Yellow
     Write-Host "  - Grafana:      http://localhost:3000 (admin/admin)" -ForegroundColor Yellow
 }
