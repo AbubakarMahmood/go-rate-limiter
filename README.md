@@ -2,7 +2,7 @@
 
 A high-performance, distributed rate limiting microservice built in Go, designed to handle millions of requests per second with sub-millisecond latency.
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
@@ -99,7 +99,7 @@ type Store interface {
 
 | Component | Technology |
 |-----------|------------|
-| **Language** | Go 1.21+ |
+| **Language** | Go 1.23+ |
 | **Distributed State** | Redis (with Lua scripts) |
 | **Configuration Store** | PostgreSQL |
 | **HTTP Framework** | Gin / Fiber |
@@ -194,7 +194,7 @@ curl -X POST http://localhost:8080/v1/check \
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.23 or higher
 - Docker and Docker Compose (for local development)
 - Redis 6.0+ (optional for local development)
 
