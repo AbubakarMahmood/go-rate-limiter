@@ -6,6 +6,28 @@ A high-performance, distributed rate limiting microservice built in Go, designed
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+## 🎯 Quick Links
+
+**New to this project?** Start here:
+
+- 📘 **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes with all common commands
+- 📚 **[EXAMPLES.md](EXAMPLES.md)** - Real-world code examples and integration guides
+- 📋 **[CHEATSHEET.md](CHEATSHEET.md)** - Quick reference for commands, queries, and API calls
+
+**Quick Commands:**
+```powershell
+.\build.ps1 docker-up    # Start everything
+.\test-api.ps1           # Test the API
+.\build.ps1 docker-down  # Stop everything
+```
+
+**Service URLs:**
+- API: http://localhost:8081
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (admin/admin)
+
+---
+
 ## 📋 Overview
 
 This is a production-grade rate limiting service that implements multiple industry-standard algorithms and can be deployed as a standalone microservice or sidecar. Built with performance, scalability, and reliability in mind, it demonstrates advanced systems programming, concurrency patterns, and distributed systems design in Go.
