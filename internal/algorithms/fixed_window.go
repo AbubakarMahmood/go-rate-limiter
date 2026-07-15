@@ -1,98 +1,97 @@
+// Package algorithms implements the rate-limiting algorithms on top of the
+// atomic operations exposed by limiter.Store. The algorithms hold no mutable
+// state and no locks of their own: all synchronization lives in the store,
+// which is what makes the same code correct for both the in-memory backend
+// and a Redis backend shared by many application instances.
 package algorithms
 
 import (
+	"context"
 	"fmt"
-	"sync"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 )
 
-// FixedWindowCounter implements fixed window counter algorithm
-// Simple and fast - divides time into fixed windows
-// Trade-off: allows bursts at window boundaries (2x limit possible)
-// Lowest memory usage and highest performance
+// FixedWindowCounter divides time into fixed windows and counts requests in
+// each. It is the cheapest algorithm — one counter per key — at the cost of
+// admitting up to 2x the limit across a window boundary.
 type FixedWindowCounter struct {
 	store  limiter.Store
 	limit  int
 	window time.Duration
-	mu     sync.RWMutex
+	ttl    time.Duration
 }
 
-// NewFixedWindowCounter creates a new fixed window counter rate limiter
+// NewFixedWindowCounter creates a fixed-window limiter allowing
+// config.Limit requests per config.Window.
 func NewFixedWindowCounter(store limiter.Store, config limiter.Config) *FixedWindowCounter {
 	return &FixedWindowCounter{
 		store:  store,
 		limit:  config.Limit,
 		window: config.Window,
+		// Once two windows have passed, expired state is indistinguishable
+		// from a zero counter, so it is safe to evict.
+		ttl: 2*config.Window + time.Second,
 	}
 }
 
-// Allow checks if a single request is allowed
-func (fwc *FixedWindowCounter) Allow(key string) (bool, *limiter.LimitInfo, error) {
-	return fwc.AllowN(key, 1)
+// Allow implements limiter.RateLimiter.
+func (f *FixedWindowCounter) Allow(ctx context.Context, key string) (*limiter.Result, error) {
+	return f.AllowN(ctx, key, 1)
 }
 
-// AllowN checks if N requests are allowed
-func (fwc *FixedWindowCounter) AllowN(key string, n int) (bool, *limiter.LimitInfo, error) {
-	fwc.mu.Lock()
-	defer fwc.mu.Unlock()
+// AllowN implements limiter.RateLimiter.
+func (f *FixedWindowCounter) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
+	if n < 0 {
+		return nil, limiter.ErrInvalidCount
+	}
+	if n > f.limit {
+		return nil, limiter.ErrExceedsLimit
+	}
 
-	now := time.Now()
-	// Truncate to get the current window start
-	currentWindow := now.Truncate(fwc.window)
-
-	// Get current count for this window
-	windows, err := fwc.store.GetWindows(key, currentWindow, now)
+	w, err := f.store.IncrWindow(ctx, "fw:"+key, f.window, int64(n), int64(f.limit), false, f.ttl)
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to get windows: %w", err)
+		return nil, fmt.Errorf("fixed window: %w", err)
+	}
+	return f.result(w), nil
+}
+
+// Peek implements limiter.RateLimiter.
+func (f *FixedWindowCounter) Peek(ctx context.Context, key string) (*limiter.Result, error) {
+	w, err := f.store.IncrWindow(ctx, "fw:"+key, f.window, 0, int64(f.limit), false, f.ttl)
+	if err != nil {
+		return nil, fmt.Errorf("fixed window: %w", err)
 	}
 
-	var currentCount int64
-	for _, w := range windows {
-		if w.Timestamp.Equal(currentWindow) {
-			currentCount = w.Count
-		}
+	r := f.result(w)
+	r.Allowed = r.Remaining >= 1
+	if !r.Allowed {
+		r.RetryAfter = r.ResetAt.Sub(w.Now)
 	}
+	return r, nil
+}
 
-	// Check if request allowed
-	allowed := currentCount+int64(n) <= int64(fwc.limit)
+// Reset implements limiter.RateLimiter.
+func (f *FixedWindowCounter) Reset(ctx context.Context, key string) error {
+	return f.store.Delete(ctx, "fw:"+key)
+}
 
-	if allowed {
-		// Increment the counter
-		newCount, err := fwc.store.Increment(key, currentWindow)
-		if err != nil {
-			return false, nil, fmt.Errorf("failed to increment: %w", err)
-		}
-		currentCount = newCount
-	}
-
-	remaining := fwc.limit - int(currentCount)
+func (f *FixedWindowCounter) result(w *limiter.WindowResult) *limiter.Result {
+	remaining := f.limit - int(w.Current)
 	if remaining < 0 {
 		remaining = 0
 	}
 
-	// Reset time is at the start of next window
-	resetAt := currentWindow.Add(fwc.window)
-
-	info := &limiter.LimitInfo{
-		Limit:     fwc.limit,
+	resetAt := w.WindowStart.Add(f.window)
+	r := &limiter.Result{
+		Allowed:   w.Allowed,
+		Limit:     f.limit,
 		Remaining: remaining,
 		ResetAt:   resetAt,
 	}
-
-	// Calculate retry after if denied
-	if !allowed {
-		retryAfter := resetAt.Sub(now)
-		info.RetryAfter = &retryAfter
+	if !w.Allowed {
+		r.RetryAfter = resetAt.Sub(w.Now)
 	}
-
-	return allowed, info, nil
-}
-
-// Reset resets the rate limit for a key
-func (fwc *FixedWindowCounter) Reset(key string) error {
-	fwc.mu.Lock()
-	defer fwc.mu.Unlock()
-	return fwc.store.Delete(key)
+	return r
 }

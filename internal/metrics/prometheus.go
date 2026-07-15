@@ -1,3 +1,4 @@
+// Package metrics exposes the service's Prometheus instrumentation.
 package metrics
 
 import (
@@ -5,90 +6,45 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Metrics holds all Prometheus metrics for the rate limiter
+// Metrics holds the Prometheus collectors for rate-limit decisions.
+//
+// key_prefix is the first dot-separated segment of the resource (e.g. "api"
+// for "api.users.create"), which keeps label cardinality bounded by the
+// caller's resource taxonomy rather than by raw identifiers.
 type Metrics struct {
-	RequestsTotal   *prometheus.CounterVec
-	RequestsAllowed *prometheus.CounterVec
-	RequestsDenied  *prometheus.CounterVec
-	Latency         *prometheus.HistogramVec
-	RedisErrors     *prometheus.CounterVec
-	StoreOperations *prometheus.HistogramVec
+	Requests *prometheus.CounterVec
+	Duration *prometheus.HistogramVec
 }
 
-// NewMetrics creates and registers Prometheus metrics
-func NewMetrics() *Metrics {
+// New registers the collectors with reg and returns them. Tests pass their
+// own registry; main passes prometheus.DefaultRegisterer.
+func New(reg prometheus.Registerer) *Metrics {
+	factory := promauto.With(reg)
 	return &Metrics{
-		RequestsTotal: promauto.NewCounterVec(
+		Requests: factory.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "rate_limiter_requests_total",
-				Help: "Total number of rate limit check requests",
+				Help: "Rate-limit checks processed, by algorithm and outcome.",
 			},
-			[]string{"algorithm", "key_prefix"},
+			[]string{"algorithm", "key_prefix", "result"},
 		),
-
-		RequestsAllowed: promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "rate_limiter_requests_allowed",
-				Help: "Number of requests allowed",
-			},
-			[]string{"algorithm", "key_prefix"},
-		),
-
-		RequestsDenied: promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "rate_limiter_requests_denied",
-				Help: "Number of requests denied",
-			},
-			[]string{"algorithm", "key_prefix"},
-		),
-
-		Latency: promauto.NewHistogramVec(
+		Duration: factory.NewHistogramVec(
 			prometheus.HistogramOpts{
-				Name:    "rate_limiter_latency_seconds",
-				Help:    "Request latency in seconds",
+				Name:    "rate_limiter_request_duration_seconds",
+				Help:    "Latency of rate-limit checks.",
 				Buckets: []float64{.0001, .0005, .001, .005, .01, .05, .1, .5, 1},
 			},
-			[]string{"algorithm", "operation"},
-		),
-
-		RedisErrors: promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "rate_limiter_redis_errors_total",
-				Help: "Total number of Redis errors",
-			},
-			[]string{"operation"},
-		),
-
-		StoreOperations: promauto.NewHistogramVec(
-			prometheus.HistogramOpts{
-				Name:    "rate_limiter_store_operations_seconds",
-				Help:    "Store operation latency in seconds",
-				Buckets: []float64{.0001, .0005, .001, .005, .01, .05, .1},
-			},
-			[]string{"store_type", "operation"},
+			[]string{"algorithm"},
 		),
 	}
 }
 
-// RecordRequest records a rate limit check
-func (m *Metrics) RecordRequest(algorithm, keyPrefix string, allowed bool, latency float64) {
-	m.RequestsTotal.WithLabelValues(algorithm, keyPrefix).Inc()
-
-	if allowed {
-		m.RequestsAllowed.WithLabelValues(algorithm, keyPrefix).Inc()
-	} else {
-		m.RequestsDenied.WithLabelValues(algorithm, keyPrefix).Inc()
+// RecordRequest records one rate-limit decision.
+func (m *Metrics) RecordRequest(algorithm, keyPrefix string, allowed bool, seconds float64) {
+	result := "allowed"
+	if !allowed {
+		result = "denied"
 	}
-
-	m.Latency.WithLabelValues(algorithm, "check").Observe(latency)
-}
-
-// RecordRedisError records a Redis error
-func (m *Metrics) RecordRedisError(operation string) {
-	m.RedisErrors.WithLabelValues(operation).Inc()
-}
-
-// RecordStoreOperation records a store operation
-func (m *Metrics) RecordStoreOperation(storeType, operation string, latency float64) {
-	m.StoreOperations.WithLabelValues(storeType, operation).Observe(latency)
+	m.Requests.WithLabelValues(algorithm, keyPrefix, result).Inc()
+	m.Duration.WithLabelValues(algorithm).Observe(seconds)
 }

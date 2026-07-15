@@ -1,109 +1,96 @@
 package algorithms
 
 import (
+	"context"
 	"fmt"
-	"sync"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 )
 
-// TokenBucket implements the token bucket rate limiting algorithm
-// Tokens are added at a constant rate, and each request consumes one token
-// Provides smooth rate limiting with burst handling
+// TokenBucket refills a bucket of capacity tokens at a constant rate; each
+// request consumes tokens. It shapes traffic to a smooth average rate while
+// letting clients spend accumulated tokens in bursts up to the capacity.
 type TokenBucket struct {
-	store      limiter.Store
-	capacity   int           // Maximum tokens in bucket
-	refillRate float64       // Tokens added per second
-	window     time.Duration // Not used in token bucket but kept for interface consistency
-	mu         sync.RWMutex  // Protects in-memory operations
+	store        limiter.Store
+	capacity     int
+	refillPerSec float64
+	ttl          time.Duration
 }
 
-// NewTokenBucket creates a new token bucket rate limiter
+// NewTokenBucket creates a token-bucket limiter that refills config.Limit
+// tokens per config.Window, holding at most config.Burst tokens
+// (config.Limit when Burst is zero).
 func NewTokenBucket(store limiter.Store, config limiter.Config) *TokenBucket {
 	capacity := config.Burst
-	if capacity == 0 {
+	if capacity <= 0 {
 		capacity = config.Limit
 	}
-
-	// Calculate refill rate: tokens per second
-	refillRate := float64(config.Limit) / config.Window.Seconds()
+	refillPerSec := float64(config.Limit) / config.Window.Seconds()
 
 	return &TokenBucket{
-		store:      store,
-		capacity:   capacity,
-		refillRate: refillRate,
-		window:     config.Window,
+		store:        store,
+		capacity:     capacity,
+		refillPerSec: refillPerSec,
+		// Give idle state exactly as long as a full refill takes, plus
+		// slack: an evicted bucket re-initializes full, so expiring any
+		// earlier would hand out tokens ahead of schedule.
+		ttl: durationFromSeconds(float64(capacity)/refillPerSec) + time.Second,
 	}
 }
 
-// Allow checks if a single request is allowed
-func (tb *TokenBucket) Allow(key string) (bool, *limiter.LimitInfo, error) {
-	return tb.AllowN(key, 1)
+// Allow implements limiter.RateLimiter.
+func (tb *TokenBucket) Allow(ctx context.Context, key string) (*limiter.Result, error) {
+	return tb.AllowN(ctx, key, 1)
 }
 
-// AllowN checks if N requests are allowed
-func (tb *TokenBucket) AllowN(key string, n int) (bool, *limiter.LimitInfo, error) {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
+// AllowN implements limiter.RateLimiter.
+func (tb *TokenBucket) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
+	if n < 0 {
+		return nil, limiter.ErrInvalidCount
+	}
+	if n > tb.capacity {
+		return nil, limiter.ErrExceedsLimit
+	}
 
-	now := time.Now()
-
-	// Get current tokens and last refill time
-	tokens, lastRefill, err := tb.store.GetTokens(key)
+	allowed, tokens, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, float64(n), tb.ttl)
 	if err != nil {
-		// First request - initialize with full bucket
-		tokens = float64(tb.capacity)
-		lastRefill = now
+		return nil, fmt.Errorf("token bucket: %w", err)
 	}
-
-	// Calculate tokens to add based on time elapsed
-	elapsed := now.Sub(lastRefill).Seconds()
-	tokens += elapsed * tb.refillRate
-
-	// Cap at capacity
-	if tokens > float64(tb.capacity) {
-		tokens = float64(tb.capacity)
-	}
-
-	// Check if enough tokens available
-	allowed := tokens >= float64(n)
-	remaining := int(tokens)
-
-	if allowed {
-		tokens -= float64(n)
-		remaining = int(tokens)
-	}
-
-	// Save updated state
-	if err := tb.store.SetTokens(key, tokens, now); err != nil {
-		return false, nil, fmt.Errorf("failed to update tokens: %w", err)
-	}
-
-	// Calculate reset time (when bucket will be full again)
-	tokensNeeded := float64(tb.capacity) - tokens
-	resetDuration := time.Duration(tokensNeeded/tb.refillRate) * time.Second
-	resetAt := now.Add(resetDuration)
-
-	info := &limiter.LimitInfo{
-		Limit:     tb.capacity,
-		Remaining: remaining,
-		ResetAt:   resetAt,
-	}
-
-	// If denied, calculate retry after
-	if !allowed {
-		tokensNeeded := float64(n) - tokens
-		retryAfter := time.Duration(tokensNeeded/tb.refillRate) * time.Second
-		info.RetryAfter = &retryAfter
-	}
-
-	return allowed, info, nil
+	return tb.result(allowed, tokens, n), nil
 }
 
-// Reset resets the rate limit for a key
-func (tb *TokenBucket) Reset(key string) error {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	return tb.store.Delete(key)
+// Peek implements limiter.RateLimiter.
+func (tb *TokenBucket) Peek(ctx context.Context, key string) (*limiter.Result, error) {
+	_, tokens, err := tb.store.TakeTokens(ctx, "tb:"+key, float64(tb.capacity), tb.refillPerSec, 0, tb.ttl)
+	if err != nil {
+		return nil, fmt.Errorf("token bucket: %w", err)
+	}
+	return tb.result(tokens >= 1, tokens, 1), nil
+}
+
+// Reset implements limiter.RateLimiter.
+func (tb *TokenBucket) Reset(ctx context.Context, key string) error {
+	return tb.store.Delete(ctx, "tb:"+key)
+}
+
+func (tb *TokenBucket) result(allowed bool, tokens float64, n int) *limiter.Result {
+	r := &limiter.Result{
+		Allowed:   allowed,
+		Limit:     tb.capacity,
+		Remaining: int(tokens),
+		// ResetAt reports when the bucket will be full again at the
+		// current refill rate.
+		ResetAt: time.Now().Add(durationFromSeconds((float64(tb.capacity) - tokens) / tb.refillPerSec)),
+	}
+	if !allowed {
+		r.RetryAfter = durationFromSeconds((float64(n) - tokens) / tb.refillPerSec)
+	}
+	return r
+}
+
+// durationFromSeconds converts fractional seconds without the truncation
+// that time.Duration(int) * time.Second would introduce.
+func durationFromSeconds(s float64) time.Duration {
+	return time.Duration(s * float64(time.Second))
 }

@@ -6,34 +6,32 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisStore implements a Redis-backed store for distributed rate limiting
-// Uses Lua scripts for atomic operations
-// Supports Redis Cluster for horizontal scaling
+// RedisStore is a Redis-backed limiter.Store for distributed deployments.
+// Every decision executes as a single Lua script, so concurrent checks from
+// any number of application instances serialize on the Redis server and can
+// never over-admit. Scripts read the Redis server clock (TIME), which keeps
+// instances with skewed local clocks consistent with each other.
 type RedisStore struct {
 	client redis.UniversalClient
-	ctx    context.Context
-	ttl    time.Duration // TTL for keys to prevent memory leaks
 }
 
-// RedisConfig holds Redis connection configuration
+// RedisConfig holds Redis connection configuration.
 type RedisConfig struct {
-	Addresses []string
+	Addresses []string // one address for a single instance, several for cluster mode
 	Password  string
-	DB        int
+	DB        int // ignored in cluster mode
 	PoolSize  int
-	TTL       time.Duration
 }
 
-// NewRedisStore creates a new Redis store
+// NewRedisStore connects to Redis (or a Redis Cluster when more than one
+// address is given) and verifies the connection.
 func NewRedisStore(config RedisConfig) (*RedisStore, error) {
 	var client redis.UniversalClient
-
 	if len(config.Addresses) == 1 {
-		// Single instance
 		client = redis.NewClient(&redis.Options{
 			Addr:     config.Addresses[0],
 			Password: config.Password,
@@ -41,7 +39,6 @@ func NewRedisStore(config RedisConfig) (*RedisStore, error) {
 			PoolSize: config.PoolSize,
 		})
 	} else {
-		// Redis Cluster
 		client = redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs:    config.Addresses,
 			Password: config.Password,
@@ -49,162 +46,229 @@ func NewRedisStore(config RedisConfig) (*RedisStore, error) {
 		})
 	}
 
-	ctx := context.Background()
-
-	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+		_ = client.Close()
+		return nil, fmt.Errorf("connecting to redis: %w", err)
 	}
 
-	ttl := config.TTL
-	if ttl == 0 {
-		ttl = 24 * time.Hour // Default TTL
+	return &RedisStore{client: client}, nil
+}
+
+// incrWindowScript implements fixed- and sliding-window admission in one
+// atomic step. State is a hash keyed by window start (unix microseconds);
+// only the current and previous windows are ever read, and stale fields are
+// pruned on write, so each key holds at most a handful of fields.
+//
+// KEYS[1] counter key
+// ARGV[1] window length, microseconds
+// ARGV[2] permits requested (0 = read-only peek)
+// ARGV[3] limit
+// ARGV[4] 1 = weigh the previous window (sliding), 0 = ignore it (fixed)
+// ARGV[5] TTL, seconds
+//
+// Returns {allowed, current, previous, windowStartMicros, nowMicros}.
+var incrWindowScript = redis.NewScript(`
+local window = tonumber(ARGV[1])
+local n = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local weigh_prev = tonumber(ARGV[4]) == 1
+local ttl = tonumber(ARGV[5])
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
+local cur_start = now - (now % window)
+local prev_start = cur_start - window
+
+local cur = tonumber(redis.call('HGET', KEYS[1], tostring(cur_start)) or '0')
+local prev = 0
+if weigh_prev then
+	prev = tonumber(redis.call('HGET', KEYS[1], tostring(prev_start)) or '0')
+end
+
+local weighted = cur
+if weigh_prev and prev > 0 then
+	weighted = cur + prev * (1 - (now - cur_start) / window)
+end
+
+local allowed = 0
+if weighted + n <= limit then
+	allowed = 1
+	if n > 0 then
+		cur = redis.call('HINCRBY', KEYS[1], tostring(cur_start), n)
+		for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+			if tonumber(field) < prev_start then
+				redis.call('HDEL', KEYS[1], field)
+			end
+		end
+		redis.call('EXPIRE', KEYS[1], ttl)
+	end
+end
+
+return {allowed, cur, prev, tostring(cur_start), tostring(now)}
+`)
+
+// takeTokensScript implements token-bucket admission in one atomic step.
+// State is the token count plus the last-refill timestamp, stored with
+// microsecond precision as fractional unix seconds.
+//
+// KEYS[1] bucket key
+// ARGV[1] capacity
+// ARGV[2] refill rate, tokens per second
+// ARGV[3] tokens requested (0 = read-only peek)
+// ARGV[4] TTL, seconds
+//
+// Returns {allowed, tokensAfter}. Nothing is written on denial or peek: the
+// stored (tokens, ts) pair regenerates the same balance on the next call.
+var takeTokensScript = redis.NewScript(`
+local capacity = tonumber(ARGV[1])
+local refill = tonumber(ARGV[2])
+local n = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1])
+local ts = tonumber(state[2])
+if tokens == nil or ts == nil then
+	tokens = capacity
+	ts = now
+end
+
+local elapsed = now - ts
+if elapsed > 0 then
+	tokens = tokens + elapsed * refill
+	if tokens > capacity then
+		tokens = capacity
+	end
+end
+
+local allowed = 0
+if n <= tokens then
+	allowed = 1
+	if n > 0 then
+		tokens = tokens - n
+		redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+		redis.call('EXPIRE', KEYS[1], ttl)
+	end
+end
+
+return {allowed, tostring(tokens)}
+`)
+
+// IncrWindow implements limiter.Store.
+func (rs *RedisStore) IncrWindow(ctx context.Context, key string, window time.Duration, n, limit int64, weightPrev bool, ttl time.Duration) (*limiter.WindowResult, error) {
+	weigh := 0
+	if weightPrev {
+		weigh = 1
 	}
 
-	return &RedisStore{
-		client: client,
-		ctx:    ctx,
-		ttl:    ttl,
+	raw, err := incrWindowScript.Run(ctx, rs.client, []string{"rl:" + key},
+		window.Microseconds(), n, limit, weigh, ttlSeconds(ttl)).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis window increment: %w", err)
+	}
+
+	reply, ok := raw.([]interface{})
+	if !ok || len(reply) != 5 {
+		return nil, fmt.Errorf("redis window increment: unexpected reply %T", raw)
+	}
+
+	var fields [5]int64
+	for i, v := range reply {
+		f, err := replyInt(v)
+		if err != nil {
+			return nil, fmt.Errorf("redis window increment: %w", err)
+		}
+		fields[i] = f
+	}
+
+	return &limiter.WindowResult{
+		Allowed:     fields[0] == 1,
+		Current:     fields[1],
+		Previous:    fields[2],
+		WindowStart: time.UnixMicro(fields[3]),
+		Now:         time.UnixMicro(fields[4]),
 	}, nil
 }
 
-// Lua script for atomic increment with expiry
-var incrementScript = redis.NewScript(`
-	local key = KEYS[1]
-	local window = ARGV[1]
-	local ttl = tonumber(ARGV[2])
-
-	local field = window
-	local count = redis.call('HINCRBY', key, field, 1)
-
-	if count == 1 then
-		redis.call('EXPIRE', key, ttl)
-	end
-
-	return count
-`)
-
-// Increment increments the counter for a key at a specific window
-func (rs *RedisStore) Increment(key string, window time.Time) (int64, error) {
-	windowKey := fmt.Sprintf("window:%s", key)
-	windowStr := strconv.FormatInt(window.Unix(), 10)
-
-	result, err := incrementScript.Run(
-		rs.ctx,
-		rs.client,
-		[]string{windowKey},
-		windowStr,
-		int(rs.ttl.Seconds()),
-	).Result()
-
+// TakeTokens implements limiter.Store.
+func (rs *RedisStore) TakeTokens(ctx context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (bool, float64, error) {
+	raw, err := takeTokensScript.Run(ctx, rs.client, []string{"rl:" + key},
+		formatFloat(capacity), formatFloat(refillPerSec), formatFloat(n), ttlSeconds(ttl)).Result()
 	if err != nil {
-		return 0, fmt.Errorf("increment failed: %w", err)
+		return false, 0, fmt.Errorf("redis token take: %w", err)
 	}
 
-	count, ok := result.(int64)
-	if !ok {
-		return 0, fmt.Errorf("unexpected result type: %T", result)
+	reply, ok := raw.([]interface{})
+	if !ok || len(reply) != 2 {
+		return false, 0, fmt.Errorf("redis token take: unexpected reply %T", raw)
 	}
 
-	return count, nil
+	allowed, err := replyInt(reply[0])
+	if err != nil {
+		return false, 0, fmt.Errorf("redis token take: %w", err)
+	}
+	tokens, err := replyFloat(reply[1])
+	if err != nil {
+		return false, 0, fmt.Errorf("redis token take: %w", err)
+	}
+	return allowed == 1, tokens, nil
 }
 
-// GetWindows returns all windows for a key within a time range
-func (rs *RedisStore) GetWindows(key string, from, to time.Time) ([]limiter.Window, error) {
-	windowKey := fmt.Sprintf("window:%s", key)
-
-	// Get all fields and values from the hash
-	result, err := rs.client.HGetAll(rs.ctx, windowKey).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get windows: %w", err)
+// Delete implements limiter.Store.
+func (rs *RedisStore) Delete(ctx context.Context, key string) error {
+	if err := rs.client.Del(ctx, "rl:"+key).Err(); err != nil {
+		return fmt.Errorf("redis delete: %w", err)
 	}
-
-	windows := make([]limiter.Window, 0)
-	for field, value := range result {
-		timestamp, err := strconv.ParseInt(field, 10, 64)
-		if err != nil {
-			continue
-		}
-
-		t := time.Unix(timestamp, 0)
-		if (t.Equal(from) || t.After(from)) && (t.Equal(to) || t.Before(to)) {
-			count, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				continue
-			}
-
-			windows = append(windows, limiter.Window{
-				Timestamp: t,
-				Count:     count,
-			})
-		}
-	}
-
-	return windows, nil
-}
-
-// SetTokens sets the token count and last refill time for token bucket
-func (rs *RedisStore) SetTokens(key string, tokens float64, lastRefill time.Time) error {
-	tokenKey := fmt.Sprintf("tokens:%s", key)
-
-	pipe := rs.client.Pipeline()
-	pipe.HSet(rs.ctx, tokenKey, "tokens", tokens)
-	pipe.HSet(rs.ctx, tokenKey, "last_refill", lastRefill.Unix())
-	pipe.Expire(rs.ctx, tokenKey, rs.ttl)
-
-	_, err := pipe.Exec(rs.ctx)
-	if err != nil {
-		return fmt.Errorf("failed to set tokens: %w", err)
-	}
-
 	return nil
 }
 
-// GetTokens gets the token count and last refill time for token bucket
-func (rs *RedisStore) GetTokens(key string) (tokens float64, lastRefill time.Time, err error) {
-	tokenKey := fmt.Sprintf("tokens:%s", key)
-
-	result, err := rs.client.HGetAll(rs.ctx, tokenKey).Result()
-	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("failed to get tokens: %w", err)
-	}
-
-	if len(result) == 0 {
-		return 0, time.Time{}, nil
-	}
-
-	tokensStr, ok := result["tokens"]
-	if ok {
-		tokens, _ = strconv.ParseFloat(tokensStr, 64)
-	}
-
-	lastRefillStr, ok := result["last_refill"]
-	if ok {
-		lastRefillUnix, _ := strconv.ParseInt(lastRefillStr, 10, 64)
-		lastRefill = time.Unix(lastRefillUnix, 0)
-	}
-
-	return tokens, lastRefill, nil
+// Ping implements limiter.Store.
+func (rs *RedisStore) Ping(ctx context.Context) error {
+	return rs.client.Ping(ctx).Err()
 }
 
-// Delete removes all data for a key
-func (rs *RedisStore) Delete(key string) error {
-	windowKey := fmt.Sprintf("window:%s", key)
-	tokenKey := fmt.Sprintf("tokens:%s", key)
-
-	pipe := rs.client.Pipeline()
-	pipe.Del(rs.ctx, windowKey)
-	pipe.Del(rs.ctx, tokenKey)
-
-	_, err := pipe.Exec(rs.ctx)
-	if err != nil {
-		return fmt.Errorf("failed to delete: %w", err)
-	}
-
-	return nil
-}
-
-// Close closes the Redis connection
+// Close implements limiter.Store.
 func (rs *RedisStore) Close() error {
 	return rs.client.Close()
+}
+
+// ttlSeconds converts a duration to whole seconds for EXPIRE, rounding up so
+// state never expires before the algorithm expects it to.
+func ttlSeconds(ttl time.Duration) int64 {
+	secs := int64((ttl + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
+
+func formatFloat(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+func replyInt(v interface{}) (int64, error) {
+	switch t := v.(type) {
+	case int64:
+		return t, nil
+	case string:
+		return strconv.ParseInt(t, 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected reply element %T", v)
+	}
+}
+
+func replyFloat(v interface{}) (float64, error) {
+	switch t := v.(type) {
+	case string:
+		return strconv.ParseFloat(t, 64)
+	case int64:
+		return float64(t), nil
+	default:
+		return 0, fmt.Errorf("unexpected reply element %T", v)
+	}
 }

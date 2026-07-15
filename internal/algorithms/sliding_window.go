@@ -1,113 +1,124 @@
 package algorithms
 
 import (
+	"context"
 	"fmt"
-	"sync"
+	"math"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 )
 
-// SlidingWindowCounter implements sliding window counter algorithm
-// Hybrid approach that combines fixed windows with weighted counting
-// Provides good accuracy with better memory efficiency than sliding window log
+// SlidingWindowCounter approximates a true sliding window by weighting the
+// previous fixed window by how much of it still overlaps the sliding one:
+//
+//	weighted = current + previous * (1 - elapsed/window)
+//
+// It smooths the boundary bursts fixed windows allow while storing only two
+// counters per key, and is a good default for most workloads.
 type SlidingWindowCounter struct {
 	store  limiter.Store
 	limit  int
 	window time.Duration
-	mu     sync.RWMutex
+	ttl    time.Duration
 }
 
-// NewSlidingWindowCounter creates a new sliding window counter rate limiter
+// NewSlidingWindowCounter creates a sliding-window limiter allowing
+// config.Limit requests per config.Window.
 func NewSlidingWindowCounter(store limiter.Store, config limiter.Config) *SlidingWindowCounter {
 	return &SlidingWindowCounter{
 		store:  store,
 		limit:  config.Limit,
 		window: config.Window,
+		ttl:    2*config.Window + time.Second,
 	}
 }
 
-// Allow checks if a single request is allowed
-func (swc *SlidingWindowCounter) Allow(key string) (bool, *limiter.LimitInfo, error) {
-	return swc.AllowN(key, 1)
+// Allow implements limiter.RateLimiter.
+func (s *SlidingWindowCounter) Allow(ctx context.Context, key string) (*limiter.Result, error) {
+	return s.AllowN(ctx, key, 1)
 }
 
-// AllowN checks if N requests are allowed
-func (swc *SlidingWindowCounter) AllowN(key string, n int) (bool, *limiter.LimitInfo, error) {
-	swc.mu.Lock()
-	defer swc.mu.Unlock()
+// AllowN implements limiter.RateLimiter.
+func (s *SlidingWindowCounter) AllowN(ctx context.Context, key string, n int) (*limiter.Result, error) {
+	if n < 0 {
+		return nil, limiter.ErrInvalidCount
+	}
+	if n > s.limit {
+		return nil, limiter.ErrExceedsLimit
+	}
 
-	now := time.Now()
-
-	// Get current and previous window
-	currentWindow := now.Truncate(swc.window)
-	previousWindow := currentWindow.Add(-swc.window)
-
-	// Get counts from both windows
-	windows, err := swc.store.GetWindows(key, previousWindow, now)
+	w, err := s.store.IncrWindow(ctx, "sw:"+key, s.window, int64(n), int64(s.limit), true, s.ttl)
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to get windows: %w", err)
+		return nil, fmt.Errorf("sliding window: %w", err)
+	}
+	return s.result(w, n), nil
+}
+
+// Peek implements limiter.RateLimiter.
+func (s *SlidingWindowCounter) Peek(ctx context.Context, key string) (*limiter.Result, error) {
+	w, err := s.store.IncrWindow(ctx, "sw:"+key, s.window, 0, int64(s.limit), true, s.ttl)
+	if err != nil {
+		return nil, fmt.Errorf("sliding window: %w", err)
 	}
 
-	// Calculate weighted count
-	var currentCount, previousCount int64
-	for _, w := range windows {
-		if w.Timestamp.Equal(currentWindow) {
-			currentCount = w.Count
-		} else if w.Timestamp.Equal(previousWindow) {
-			previousCount = w.Count
-		}
+	r := s.result(w, 1)
+	r.Allowed = r.Remaining >= 1
+	if !r.Allowed {
+		r.RetryAfter = s.retryAfter(w, 1)
 	}
+	return r, nil
+}
 
-	// Calculate the weight of the previous window
-	// This gives us a smooth sliding window effect
-	elapsedInCurrentWindow := now.Sub(currentWindow)
-	weight := 1.0 - (float64(elapsedInCurrentWindow) / float64(swc.window))
+// Reset implements limiter.RateLimiter.
+func (s *SlidingWindowCounter) Reset(ctx context.Context, key string) error {
+	return s.store.Delete(ctx, "sw:"+key)
+}
 
-	// Weighted count = current window + (previous window * weight)
-	weightedCount := float64(currentCount) + (float64(previousCount) * weight)
-
-	// Check if request allowed
-	allowed := weightedCount+float64(n) <= float64(swc.limit)
-
-	if allowed {
-		// Increment current window
-		newCount, err := swc.store.Increment(key, currentWindow)
-		if err != nil {
-			return false, nil, fmt.Errorf("failed to increment: %w", err)
-		}
-		currentCount = newCount
-		// Recalculate weighted count after increment
-		weightedCount = float64(currentCount) + (float64(previousCount) * weight)
+func (s *SlidingWindowCounter) result(w *limiter.WindowResult, n int) *limiter.Result {
+	weight := 1 - float64(w.Now.Sub(w.WindowStart))/float64(s.window)
+	if weight < 0 {
+		weight = 0
 	}
+	weighted := float64(w.Current) + float64(w.Previous)*weight
 
-	remaining := int(float64(swc.limit) - weightedCount)
+	// Ceil is the conservative choice: never promise a permit the weighted
+	// count would deny. The epsilon keeps exact integers from rounding up.
+	remaining := s.limit - int(math.Ceil(weighted-1e-9))
 	if remaining < 0 {
 		remaining = 0
 	}
 
-	// Reset time is at the start of next window
-	resetAt := currentWindow.Add(swc.window)
-
-	info := &limiter.LimitInfo{
-		Limit:     swc.limit,
+	r := &limiter.Result{
+		Allowed:   w.Allowed,
+		Limit:     s.limit,
 		Remaining: remaining,
-		ResetAt:   resetAt,
+		ResetAt:   w.WindowStart.Add(s.window),
 	}
-
-	// Calculate retry after if denied
-	if !allowed {
-		// Retry after the window slides enough to allow the request
-		retryAfter := resetAt.Sub(now)
-		info.RetryAfter = &retryAfter
+	if !w.Allowed {
+		r.RetryAfter = s.retryAfter(w, n)
 	}
-
-	return allowed, info, nil
+	return r
 }
 
-// Reset resets the rate limit for a key
-func (swc *SlidingWindowCounter) Reset(key string) error {
-	swc.mu.Lock()
-	defer swc.mu.Unlock()
-	return swc.store.Delete(key)
+// retryAfter solves the weighted-count formula for the earliest time the
+// denied request could succeed. With x the elapsed fraction of the current
+// window, admission requires
+//
+//	current + previous*(1-x) + n <= limit
+//
+// which holds once x >= (current + previous + n - limit) / previous.
+func (s *SlidingWindowCounter) retryAfter(w *limiter.WindowResult, n int) time.Duration {
+	if w.Previous > 0 {
+		frac := float64(w.Current+w.Previous+int64(n)-int64(s.limit)) / float64(w.Previous)
+		if frac <= 1 {
+			target := w.WindowStart.Add(time.Duration(frac * float64(s.window)))
+			if d := target.Sub(w.Now); d > 0 {
+				return d
+			}
+		}
+	}
+	// The previous window sliding off is not enough; the current window
+	// itself must roll over before the count can drop.
+	return w.WindowStart.Add(s.window).Sub(w.Now)
 }

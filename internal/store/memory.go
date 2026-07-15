@@ -1,142 +1,242 @@
 package store
 
 import (
+	"context"
 	"sync"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 )
 
-// MemoryStore implements an in-memory store for rate limiting
-// Good for single-instance deployments and testing
-// Uses sync.Map for concurrent access
+// janitorInterval controls how often expired entries are evicted.
+const janitorInterval = 30 * time.Second
+
+// MemoryStore is an in-process limiter.Store for single-instance deployments
+// and tests. Atomicity is provided by a mutex per key, so unrelated keys
+// never contend with each other.
 type MemoryStore struct {
-	// counters stores window-based counters (for fixed/sliding window)
-	counters sync.Map // map[string]map[time.Time]int64
+	mu      sync.RWMutex
+	windows map[string]*windowEntry
+	buckets map[string]*bucketEntry
 
-	// tokens stores token bucket state
-	tokens sync.Map // map[string]*tokenState
-
-	// mu protects cleanup operations
-	mu sync.RWMutex
+	stopOnce sync.Once
+	stop     chan struct{}
 }
 
-type tokenState struct {
-	tokens     float64
-	lastRefill time.Time
-	mu         sync.RWMutex
+// windowEntry holds the two windows a decision can depend on. Older windows
+// carry no information, so state is O(1) per key regardless of uptime.
+type windowEntry struct {
+	mu        sync.Mutex
+	deleted   bool  // set by the janitor; holders must re-fetch from the map
+	curStart  int64 // unix microseconds
+	cur, prev int64
+	expiresAt int64 // unix microseconds
 }
 
-type windowCounts struct {
-	data map[time.Time]int64
-	mu   sync.RWMutex
+type bucketEntry struct {
+	mu        sync.Mutex
+	deleted   bool
+	tokens    float64
+	ts        float64 // unix seconds of the last refill, fractional
+	expiresAt int64   // unix microseconds
 }
 
-// NewMemoryStore creates a new in-memory store
+// NewMemoryStore creates an in-memory store and starts its eviction loop.
+// Call Close to stop the loop.
 func NewMemoryStore() *MemoryStore {
-	ms := &MemoryStore{}
-	// Start background cleanup goroutine
-	go ms.cleanup()
+	ms := &MemoryStore{
+		windows: make(map[string]*windowEntry),
+		buckets: make(map[string]*bucketEntry),
+		stop:    make(chan struct{}),
+	}
+	go ms.janitor()
 	return ms
 }
 
-// Increment increments the counter for a key at a specific window
-func (ms *MemoryStore) Increment(key string, window time.Time) (int64, error) {
-	// Load or create window counts for this key
-	val, _ := ms.counters.LoadOrStore(key, &windowCounts{
-		data: make(map[time.Time]int64),
-	})
-
-	wc := val.(*windowCounts)
-	wc.mu.Lock()
-	defer wc.mu.Unlock()
-
-	wc.data[window]++
-	return wc.data[window], nil
-}
-
-// GetWindows returns all windows for a key within a time range
-func (ms *MemoryStore) GetWindows(key string, from, to time.Time) ([]limiter.Window, error) {
-	val, ok := ms.counters.Load(key)
-	if !ok {
-		return []limiter.Window{}, nil
-	}
-
-	wc := val.(*windowCounts)
-	wc.mu.RLock()
-	defer wc.mu.RUnlock()
-
-	windows := make([]limiter.Window, 0)
-	for t, count := range wc.data {
-		if (t.Equal(from) || t.After(from)) && (t.Equal(to) || t.Before(to)) {
-			windows = append(windows, limiter.Window{
-				Timestamp: t,
-				Count:     count,
-			})
+// IncrWindow implements limiter.Store.
+func (ms *MemoryStore) IncrWindow(_ context.Context, key string, window time.Duration, n, limit int64, weightPrev bool, ttl time.Duration) (*limiter.WindowResult, error) {
+	for {
+		e := ms.windowEntry(key)
+		e.mu.Lock()
+		if e.deleted {
+			e.mu.Unlock()
+			continue // evicted between lookup and lock; fetch a fresh entry
 		}
-	}
 
-	return windows, nil
+		now := time.Now()
+		nowUS := now.UnixMicro()
+		w := window.Microseconds()
+		start := nowUS - nowUS%w
+
+		switch {
+		case e.curStart == start:
+			// still in the same window
+		case e.curStart == start-w:
+			e.prev, e.cur, e.curStart = e.cur, 0, start
+		default:
+			e.prev, e.cur, e.curStart = 0, 0, start
+		}
+
+		weighted := float64(e.cur)
+		if weightPrev && e.prev > 0 {
+			weighted += float64(e.prev) * (1 - float64(nowUS-start)/float64(w))
+		}
+
+		allowed := weighted+float64(n) <= float64(limit)
+		if allowed && n > 0 {
+			e.cur += n
+		}
+		// Every touch counts as activity, including peeks and denials;
+		// otherwise an entry created by a peek would never expire.
+		e.expiresAt = nowUS + ttl.Microseconds()
+
+		res := &limiter.WindowResult{
+			Allowed:     allowed,
+			Current:     e.cur,
+			Previous:    e.prev,
+			WindowStart: time.UnixMicro(start),
+			Now:         now,
+		}
+		e.mu.Unlock()
+		return res, nil
+	}
 }
 
-// SetTokens sets the token count and last refill time for token bucket
-func (ms *MemoryStore) SetTokens(key string, tokens float64, lastRefill time.Time) error {
-	val, _ := ms.tokens.LoadOrStore(key, &tokenState{})
-	ts := val.(*tokenState)
+// TakeTokens implements limiter.Store.
+func (ms *MemoryStore) TakeTokens(_ context.Context, key string, capacity, refillPerSec, n float64, ttl time.Duration) (bool, float64, error) {
+	for {
+		e := ms.bucketEntry(key, capacity)
+		e.mu.Lock()
+		if e.deleted {
+			e.mu.Unlock()
+			continue
+		}
 
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+		now := time.Now()
+		nowSec := float64(now.UnixMicro()) / 1e6
 
-	ts.tokens = tokens
-	ts.lastRefill = lastRefill
+		// Commit the refill unconditionally: tokens and ts must advance
+		// together or the same elapsed time would be credited twice.
+		if elapsed := nowSec - e.ts; elapsed > 0 {
+			e.tokens += elapsed * refillPerSec
+			if e.tokens > capacity {
+				e.tokens = capacity
+			}
+		}
+		e.ts = nowSec
+
+		allowed := n <= e.tokens
+		if allowed && n > 0 {
+			e.tokens -= n
+		}
+		e.expiresAt = now.UnixMicro() + ttl.Microseconds()
+
+		tokens := e.tokens
+		e.mu.Unlock()
+		return allowed, tokens, nil
+	}
+}
+
+// Delete implements limiter.Store.
+func (ms *MemoryStore) Delete(_ context.Context, key string) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if e, ok := ms.windows[key]; ok {
+		e.mu.Lock()
+		e.deleted = true
+		e.mu.Unlock()
+		delete(ms.windows, key)
+	}
+	if e, ok := ms.buckets[key]; ok {
+		e.mu.Lock()
+		e.deleted = true
+		e.mu.Unlock()
+		delete(ms.buckets, key)
+	}
 	return nil
 }
 
-// GetTokens gets the token count and last refill time for token bucket
-func (ms *MemoryStore) GetTokens(key string) (tokens float64, lastRefill time.Time, err error) {
-	val, ok := ms.tokens.Load(key)
-	if !ok {
-		return 0, time.Time{}, nil
-	}
+// Ping implements limiter.Store.
+func (ms *MemoryStore) Ping(context.Context) error { return nil }
 
-	ts := val.(*tokenState)
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-
-	return ts.tokens, ts.lastRefill, nil
-}
-
-// Delete removes all data for a key
-func (ms *MemoryStore) Delete(key string) error {
-	ms.counters.Delete(key)
-	ms.tokens.Delete(key)
-	return nil
-}
-
-// Close closes the store (no-op for memory store)
+// Close stops the eviction loop.
 func (ms *MemoryStore) Close() error {
+	ms.stopOnce.Do(func() { close(ms.stop) })
 	return nil
 }
 
-// cleanup periodically removes old window data to prevent memory leaks
-func (ms *MemoryStore) cleanup() {
-	ticker := time.NewTicker(1 * time.Minute)
+func (ms *MemoryStore) windowEntry(key string) *windowEntry {
+	ms.mu.RLock()
+	e, ok := ms.windows[key]
+	ms.mu.RUnlock()
+	if ok {
+		return e
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if e, ok := ms.windows[key]; ok {
+		return e
+	}
+	e = &windowEntry{}
+	ms.windows[key] = e
+	return e
+}
+
+func (ms *MemoryStore) bucketEntry(key string, capacity float64) *bucketEntry {
+	ms.mu.RLock()
+	e, ok := ms.buckets[key]
+	ms.mu.RUnlock()
+	if ok {
+		return e
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if e, ok := ms.buckets[key]; ok {
+		return e
+	}
+	// A key that has never been seen starts with a full bucket, refilled now.
+	e = &bucketEntry{tokens: capacity, ts: float64(time.Now().UnixMicro()) / 1e6}
+	ms.buckets[key] = e
+	return e
+}
+
+// janitor evicts entries whose TTL has passed. Expiry is equivalent to a
+// rolled-over window (counters) or a fully refilled bucket (tokens), so
+// eviction never changes observable behaviour.
+func (ms *MemoryStore) janitor() {
+	ticker := time.NewTicker(janitorInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		// Remove windows older than 24 hours
-		cutoff := time.Now().Add(-24 * time.Hour)
+	for {
+		select {
+		case <-ms.stop:
+			return
+		case <-ticker.C:
+			ms.sweep(time.Now().UnixMicro())
+		}
+	}
+}
 
-		ms.counters.Range(func(key, val interface{}) bool {
-			wc := val.(*windowCounts)
-			wc.mu.Lock()
-			for t := range wc.data {
-				if t.Before(cutoff) {
-					delete(wc.data, t)
-				}
-			}
-			wc.mu.Unlock()
-			return true
-		})
+// sweep evicts every entry that expired before cutoff (unix microseconds).
+func (ms *MemoryStore) sweep(cutoff int64) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	for key, e := range ms.windows {
+		e.mu.Lock()
+		if e.expiresAt != 0 && e.expiresAt < cutoff {
+			e.deleted = true
+			delete(ms.windows, key)
+		}
+		e.mu.Unlock()
+	}
+	for key, e := range ms.buckets {
+		e.mu.Lock()
+		if e.expiresAt != 0 && e.expiresAt < cutoff {
+			e.deleted = true
+			delete(ms.buckets, key)
+		}
+		e.mu.Unlock()
 	}
 }

@@ -1,50 +1,62 @@
+// Package handlers implements the HTTP API.
 package handlers
 
 import (
-	"fmt"
+	"context"
+	"errors"
+	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/AbubakarMahmood1/go-rate-limiter/internal/metrics"
-	"github.com/AbubakarMahmood1/go-rate-limiter/pkg/limiter"
+	"github.com/AbubakarMahmood/go-rate-limiter/internal/metrics"
+	"github.com/AbubakarMahmood/go-rate-limiter/pkg/limiter"
 	"github.com/gin-gonic/gin"
 )
 
-// RateLimitHandler handles rate limiting HTTP requests
+// DefaultTier is the tier used when a request names none.
+const DefaultTier = "default"
+
+// RateLimitHandler serves the rate-limiting endpoints. Limiters are indexed
+// by algorithm, then by tier.
 type RateLimitHandler struct {
-	limiters         map[string]limiter.RateLimiter // algorithm name -> limiter
+	limiters         map[string]map[string]limiter.RateLimiter
+	store            limiter.Store
 	metrics          *metrics.Metrics
-	defaultAlgorithm string // default algorithm name
+	defaultAlgorithm string
 }
 
-// NewRateLimitHandler creates a new rate limit handler
-func NewRateLimitHandler(limiters map[string]limiter.RateLimiter, metrics *metrics.Metrics, defaultAlgorithm string) *RateLimitHandler {
+// NewRateLimitHandler creates the handler.
+func NewRateLimitHandler(limiters map[string]map[string]limiter.RateLimiter, store limiter.Store, m *metrics.Metrics, defaultAlgorithm string) *RateLimitHandler {
 	return &RateLimitHandler{
 		limiters:         limiters,
-		metrics:          metrics,
+		store:            store,
+		metrics:          m,
 		defaultAlgorithm: defaultAlgorithm,
 	}
 }
 
-// CheckRequest represents a rate limit check request
+// CheckRequest is the body of POST /v1/check.
 type CheckRequest struct {
-	Resource   string `json:"resource" binding:"required"`   // Resource being accessed (e.g., "api.users.create")
-	Identifier string `json:"identifier" binding:"required"` // User/client identifier
-	Algorithm  string `json:"algorithm"`                     // Optional: override default algorithm
-	Count      int    `json:"count"`                         // Optional: number of tokens to consume (default: 1)
+	Resource   string `json:"resource" binding:"required"`   // resource being accessed, e.g. "api.users.create"
+	Identifier string `json:"identifier" binding:"required"` // caller identity, e.g. a user ID or API key
+	Algorithm  string `json:"algorithm"`                     // optional algorithm override
+	Tier       string `json:"tier"`                          // optional tier name from the configuration
+	Count      int    `json:"count"`                         // permits to consume; default 1
 }
 
-// CheckResponse represents a rate limit check response
+// CheckResponse is returned by check and status calls.
 type CheckResponse struct {
 	Allowed    bool   `json:"allowed"`
 	Limit      int    `json:"limit"`
 	Remaining  int    `json:"remaining"`
 	ResetAt    string `json:"reset_at"`
-	RetryAfter *int   `json:"retry_after,omitempty"` // Seconds to wait before retrying
+	RetryAfter *int   `json:"retry_after,omitempty"` // whole seconds, rounded up
 }
 
-// Check handles POST /v1/check - check if request is allowed
+// Check handles POST /v1/check.
 func (h *RateLimitHandler) Check(c *gin.Context) {
 	start := time.Now()
 
@@ -53,156 +65,154 @@ func (h *RateLimitHandler) Check(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	// Default to 1 token if not specified
+	if req.Count < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "count must not be negative"})
+		return
+	}
 	if req.Count == 0 {
 		req.Count = 1
 	}
 
-	// Select algorithm
-	algorithm := req.Algorithm
-	if algorithm == "" {
-		algorithm = h.defaultAlgorithm
-	}
-
-	limiterInstance, ok := h.limiters[algorithm]
+	algorithm, lim, ok := h.limiter(req.Algorithm, req.Tier)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid algorithm"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown algorithm or tier"})
 		return
 	}
 
-	// Create rate limit key
-	key := req.Identifier + ":" + req.Resource
-
-	// Check rate limit
-	allowed, info, err := limiterInstance.AllowN(key, req.Count)
+	key := composeKey(req.Tier, req.Identifier+":"+req.Resource)
+	result, err := lim.AllowN(c.Request.Context(), key, req.Count)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "rate limit check failed"})
+		h.decisionError(c, err)
 		return
 	}
 
-	// Record metrics
-	latency := time.Since(start).Seconds()
-	keyPrefix := strings.Split(req.Resource, ".")[0]
-	h.metrics.RecordRequest(algorithm, keyPrefix, allowed, latency)
+	keyPrefix, _, _ := strings.Cut(req.Resource, ".")
+	h.metrics.RecordRequest(algorithm, keyPrefix, result.Allowed, time.Since(start).Seconds())
 
-	// Build response
-	resp := CheckResponse{
-		Allowed:   allowed,
-		Limit:     info.Limit,
-		Remaining: info.Remaining,
-		ResetAt:   info.ResetAt.Format(time.RFC3339),
+	writeRateLimitHeaders(c, result)
+	status := http.StatusOK
+	if !result.Allowed {
+		status = http.StatusTooManyRequests
 	}
-
-	if info.RetryAfter != nil {
-		retrySeconds := int(info.RetryAfter.Seconds())
-		resp.RetryAfter = &retrySeconds
-	}
-
-	// Set standard rate limit headers
-	c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", info.Limit))
-	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", info.Remaining))
-	c.Header("X-RateLimit-Reset", fmt.Sprintf("%d", info.ResetAt.Unix()))
-	if info.RetryAfter != nil {
-		c.Header("Retry-After", fmt.Sprintf("%d", int(info.RetryAfter.Seconds())))
-	}
-
-	// Return 429 if rate limited
-	if !allowed {
-		c.JSON(http.StatusTooManyRequests, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, resp)
+	c.JSON(status, toResponse(result))
 }
 
-// StatusRequest represents a status check request
-type StatusRequest struct {
-	Algorithm string `form:"algorithm"` // Optional: algorithm to check
-}
-
-// GetStatus handles GET /v1/status/:key - get current limit status
+// GetStatus handles GET /v1/status/:key. The key is the same
+// "identifier:resource" pair used by check; algorithm and tier come from
+// query parameters. It never consumes permits.
 func (h *RateLimitHandler) GetStatus(c *gin.Context) {
-	key := c.Param("key")
-	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
-		return
-	}
-
-	var req StatusRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Select algorithm
-	algorithm := req.Algorithm
-	if algorithm == "" {
-		algorithm = h.defaultAlgorithm
-	}
-
-	limiterInstance, ok := h.limiters[algorithm]
+	_, lim, ok := h.limiter(c.Query("algorithm"), c.Query("tier"))
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid algorithm"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown algorithm or tier"})
 		return
 	}
 
-	// Check current status without consuming tokens
-	allowed, info, err := limiterInstance.AllowN(key, 0)
+	key := composeKey(c.Query("tier"), c.Param("key"))
+	result, err := lim.Peek(c.Request.Context(), key)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "status check failed"})
+		h.decisionError(c, err)
 		return
 	}
 
-	resp := CheckResponse{
-		Allowed:   allowed,
-		Limit:     info.Limit,
-		Remaining: info.Remaining,
-		ResetAt:   info.ResetAt.Format(time.RFC3339),
-	}
-
-	c.JSON(http.StatusOK, resp)
+	writeRateLimitHeaders(c, result)
+	c.JSON(http.StatusOK, toResponse(result))
 }
 
-// Reset handles POST /v1/reset/:key - reset limits for a key
+// Reset handles POST /v1/reset/:key. It clears state for one key under one
+// algorithm and tier.
 func (h *RateLimitHandler) Reset(c *gin.Context) {
-	key := c.Param("key")
-	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+	_, lim, ok := h.limiter(c.Query("algorithm"), c.Query("tier"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown algorithm or tier"})
 		return
 	}
 
-	var req StatusRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	key := composeKey(c.Query("tier"), c.Param("key"))
+	if err := lim.Reset(c.Request.Context(), key); err != nil {
+		h.decisionError(c, err)
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"status": "reset"})
+}
 
-	// Select algorithm
-	algorithm := req.Algorithm
+// Health handles GET /health. It reports 503 when the store is unreachable,
+// so orchestrators stop routing to an instance that cannot decide.
+func (h *RateLimitHandler) Health(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
+	defer cancel()
+
+	if err := h.store.Ping(ctx); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// limiter resolves an algorithm/tier pair, applying defaults for empty
+// values. The returned string is the resolved algorithm name.
+func (h *RateLimitHandler) limiter(algorithm, tier string) (string, limiter.RateLimiter, bool) {
 	if algorithm == "" {
 		algorithm = h.defaultAlgorithm
 	}
-
-	limiterInstance, ok := h.limiters[algorithm]
+	if tier == "" {
+		tier = DefaultTier
+	}
+	tiers, ok := h.limiters[algorithm]
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid algorithm"})
-		return
+		return algorithm, nil, false
 	}
-
-	// Reset the limit
-	if err := limiterInstance.Reset(key); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "reset failed"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "rate limit reset successfully"})
+	lim, ok := tiers[tier]
+	return algorithm, lim, ok
 }
 
-// Health handles GET /health - health check
-func (h *RateLimitHandler) Health(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status": "healthy",
-		"time":   time.Now().Format(time.RFC3339),
-	})
+func (h *RateLimitHandler) decisionError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, limiter.ErrExceedsLimit), errors.Is(err, limiter.ErrInvalidCount):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	default:
+		log.Printf("rate limit decision failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "rate limit check failed"})
+	}
+}
+
+// composeKey namespaces a client-visible key by tier so that tiers with
+// different limits never share counter state.
+func composeKey(tier, key string) string {
+	if tier == "" {
+		tier = DefaultTier
+	}
+	return tier + ":" + key
+}
+
+func toResponse(r *limiter.Result) CheckResponse {
+	resp := CheckResponse{
+		Allowed:   r.Allowed,
+		Limit:     r.Limit,
+		Remaining: r.Remaining,
+		ResetAt:   r.ResetAt.UTC().Format(time.RFC3339),
+	}
+	if !r.Allowed {
+		secs := retryAfterSeconds(r.RetryAfter)
+		resp.RetryAfter = &secs
+	}
+	return resp
+}
+
+func writeRateLimitHeaders(c *gin.Context, r *limiter.Result) {
+	c.Header("X-RateLimit-Limit", strconv.Itoa(r.Limit))
+	c.Header("X-RateLimit-Remaining", strconv.Itoa(r.Remaining))
+	c.Header("X-RateLimit-Reset", strconv.FormatInt(r.ResetAt.Unix(), 10))
+	if !r.Allowed {
+		c.Header("Retry-After", strconv.Itoa(retryAfterSeconds(r.RetryAfter)))
+	}
+}
+
+// retryAfterSeconds rounds up to whole seconds, the granularity of the
+// Retry-After header; a denied request never advertises "retry now".
+func retryAfterSeconds(d time.Duration) int {
+	secs := int(math.Ceil(d.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
 }

@@ -1,8 +1,14 @@
+# Rate limiter service configuration.
+# Environment overrides: PORT, STORE, REDIS_ADDR (comma-separated), REDIS_PASSWORD.
+
 server:
   port: 8080
   read_timeout: 5s
   write_timeout: 10s
   idle_timeout: 120s
+
+# "memory" for a single instance, "redis" for distributed deployments.
+store: memory
 
 redis:
   addresses:
@@ -10,37 +16,29 @@ redis:
   password: ""
   db: 0
   pool_size: 100
-  ttl: 24h
 
 algorithms:
+  # token_bucket | sliding_window | fixed_window
   default: token_bucket
 
 limits:
+  # Applied when a request names no tier.
   default:
     requests: 100
     window: 1m
     burst: 120
 
+  # Optional named tiers, selected per request via the "tier" field.
   tiers:
     free:
       requests: 100
       window: 1h
       burst: 120
-
     premium:
       requests: 10000
       window: 1h
       burst: 12000
 
-    enterprise:
-      requests: 100000
-      window: 1h
-      burst: 120000
-
 metrics:
   enabled: true
   path: /metrics
-  port: 8080
-
-# Store type: "memory" or "redis"
-store: memory
