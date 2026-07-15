@@ -5,6 +5,8 @@
 
 set -e
 
+# Defaults target a locally run server (go run ./cmd/server). For the Docker
+# Compose stack use: TARGET_URL=http://localhost:8081 ./scripts/load-test.sh
 DURATION=${1:-30s}
 RATE=${2:-1000}
 TARGET_URL=${TARGET_URL:-http://localhost:8080}

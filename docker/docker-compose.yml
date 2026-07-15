@@ -1,7 +1,24 @@
 services:
-  # Redis for distributed rate limiting
+  rate-limiter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: rate-limiter-service
+    ports:
+      - "8081:8080"
+    environment:
+      - STORE=redis
+      - REDIS_ADDR=redis:6379
+      - GIN_MODE=release
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rate-limiter
+    restart: unless-stopped
+
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     container_name: rate-limiter-redis
     ports:
       - "6379:6379"
@@ -16,29 +33,8 @@ services:
     networks:
       - rate-limiter
 
-  # PostgreSQL for configuration storage
-  postgres:
-    image: postgres:15-alpine
-    container_name: rate-limiter-postgres
-    environment:
-      POSTGRES_DB: ratelimiter
-      POSTGRES_USER: ratelimiter
-      POSTGRES_PASSWORD: ratelimiter
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ratelimiter"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - rate-limiter
-
-  # Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.0
     container_name: rate-limiter-prometheus
     ports:
       - "9090:9090"
@@ -48,17 +44,13 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
     depends_on:
       - rate-limiter
     networks:
       - rate-limiter
 
-  # Grafana for visualization
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.2.0
     container_name: rate-limiter-grafana
     ports:
       - "3000:3000"
@@ -75,33 +67,11 @@ services:
     networks:
       - rate-limiter
 
-  # Rate Limiter Service
-  rate-limiter:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: rate-limiter-service
-    ports:
-      - "8081:8080"
-    environment:
-      - STORE=redis
-      - REDIS_ADDR=redis:6379
-      - GIN_MODE=release
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - ../config.yaml:/app/config.yaml
-    networks:
-      - rate-limiter
-    restart: unless-stopped
-
 networks:
   rate-limiter:
     driver: bridge
 
 volumes:
   redis-data:
-  postgres-data:
   prometheus-data:
   grafana-data:

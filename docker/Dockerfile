@@ -1,37 +1,29 @@
 # Build stage
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git make
+WORKDIR /src
 
-WORKDIR /build
-
-# Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
 COPY . .
-
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o rate-limiter cmd/server/main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/rate-limiter ./cmd/server
 
 # Runtime stage
-FROM alpine:latest
+FROM alpine:3.21
 
-# Install CA certificates for HTTPS
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates \
+    && addgroup -S app \
+    && adduser -S app -G app
 
 WORKDIR /app
-
-# Copy binary from builder
-COPY --from=builder /build/rate-limiter .
-
-# Copy default config
+COPY --from=builder /out/rate-limiter .
 COPY config.yaml .
 
-# Expose port
+USER app
 EXPOSE 8080
 
-# Run the application
-CMD ["./rate-limiter"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD wget -qO- "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
+ENTRYPOINT ["/app/rate-limiter"]
