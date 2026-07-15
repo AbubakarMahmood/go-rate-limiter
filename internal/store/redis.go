@@ -81,10 +81,15 @@ local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
 local cur_start = now - (now % window)
 local prev_start = cur_start - window
 
-local cur = tonumber(redis.call('HGET', KEYS[1], tostring(cur_start)) or '0')
+-- Field names must be formatted explicitly: Lua's tostring renders large
+-- numbers in scientific notation, which loses precision.
+local cur_field = string.format('%.0f', cur_start)
+local prev_field = string.format('%.0f', prev_start)
+
+local cur = tonumber(redis.call('HGET', KEYS[1], cur_field) or '0')
 local prev = 0
 if weigh_prev then
-	prev = tonumber(redis.call('HGET', KEYS[1], tostring(prev_start)) or '0')
+	prev = tonumber(redis.call('HGET', KEYS[1], prev_field) or '0')
 end
 
 local weighted = cur
@@ -96,7 +101,7 @@ local allowed = 0
 if weighted + n <= limit then
 	allowed = 1
 	if n > 0 then
-		cur = redis.call('HINCRBY', KEYS[1], tostring(cur_start), n)
+		cur = redis.call('HINCRBY', KEYS[1], cur_field, n)
 		for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
 			if tonumber(field) < prev_start then
 				redis.call('HDEL', KEYS[1], field)
@@ -106,7 +111,9 @@ if weighted + n <= limit then
 	end
 end
 
-return {allowed, cur, prev, tostring(cur_start), tostring(now)}
+-- Microsecond timestamps stay below 2^53, so the Lua-to-integer
+-- conversion of these numbers is exact.
+return {allowed, cur, prev, cur_start, now}
 `)
 
 // takeTokensScript implements token-bucket admission in one atomic step.
@@ -151,12 +158,14 @@ if n <= tokens then
 	allowed = 1
 	if n > 0 then
 		tokens = tokens - n
-		redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+		-- %.6f keeps microsecond precision and never falls back to the
+		-- scientific notation tostring would produce.
+		redis.call('HSET', KEYS[1], 'tokens', string.format('%.6f', tokens), 'ts', string.format('%.6f', now))
 		redis.call('EXPIRE', KEYS[1], ttl)
 	end
 end
 
-return {allowed, tostring(tokens)}
+return {allowed, string.format('%.6f', tokens)}
 `)
 
 // IncrWindow implements limiter.Store.
