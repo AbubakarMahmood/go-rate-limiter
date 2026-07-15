@@ -1,248 +1,104 @@
-# 🚀 Go Rate Limiter
+# go-rate-limiter
 
-A high-performance, distributed rate limiting microservice built in Go, designed to handle millions of requests per second with sub-millisecond latency.
-
-[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![CI](https://github.com/AbubakarMahmood/go-rate-limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/AbubakarMahmood/go-rate-limiter/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-## 🎯 Quick Links
+A standalone rate-limiting service in Go. Other services call its HTTP API to ask "may this client do this thing right now?" and get an authoritative, atomic answer — with standard `X-RateLimit-*` headers, tiered limits, and Prometheus metrics included.
 
-**New to this project?** Start here:
+- **Three algorithms**: token bucket, sliding window counter, fixed window counter — selectable per request.
+- **Two storage backends**: in-memory for a single instance, Redis for a fleet. Every decision is a single atomic operation (a per-key critical section in memory, a Lua script in Redis), so concurrent requests can never over-admit — this is tested, not assumed.
+- **Tiered limits**: named tiers (e.g. `free`, `premium`) with independent budgets, defined in config and selected per request.
+- **Observability**: Prometheus metrics with a provisioned Grafana dashboard in the Compose stack.
 
-- 📘 **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes with all common commands
-- 📚 **[EXAMPLES.md](EXAMPLES.md)** - Real-world code examples and integration guides
-- 📋 **[CHEATSHEET.md](CHEATSHEET.md)** - Quick reference for commands, queries, and API calls
-
-**Quick Commands:**
-```powershell
-.\build.ps1 docker-up    # Start everything
-.\test-api.ps1           # Test the API
-.\build.ps1 docker-down  # Stop everything
-```
-
-**Service URLs:**
-- API: http://localhost:8081
-- Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (admin/admin)
-
----
-
-## 📋 Overview
-
-This is a production-grade rate limiting service that implements multiple industry-standard algorithms and can be deployed as a standalone microservice or sidecar. Built with performance, scalability, and reliability in mind, it demonstrates advanced systems programming, concurrency patterns, and distributed systems design in Go.
-
-### Key Highlights
-
-- **Ultra-Fast**: Sub-millisecond latency (p99 < 1ms)
-- **High Throughput**: 100,000+ requests per second per instance
-- **Multiple Algorithms**: Token Bucket, Sliding Window, Fixed Window, and more
-- **Distributed**: Horizontally scalable with Redis
-- **Production-Ready**: Comprehensive metrics, monitoring, and observability
-- **Zero Allocation**: Optimized hot paths for maximum performance
-
-## 🎯 Features
-
-### Multi-Algorithm Support
-
-#### 1. **Token Bucket**
-- Configurable capacity and refill rate
-- Smooth traffic shaping
-- Ideal for steady-state rate limiting
-
-#### 2. **Sliding Window Log**
-- Precise rate limiting with exact timestamps
-- Higher memory usage for maximum accuracy
-- Best for strict enforcement scenarios
-
-#### 3. **Sliding Window Counter**
-- Hybrid approach balancing accuracy and efficiency
-- Memory efficient with good precision
-- Recommended for most use cases
-
-#### 4. **Fixed Window Counter**
-- Simple and fast implementation
-- Lowest memory footprint
-- Trade-off: allows bursts at window boundaries
-
-### Production Features
-
-- ✅ **Multi-tenant Support**: API key-based identification with per-tenant configurations
-- ✅ **Dynamic Configuration**: Hot reload without restarts
-- ✅ **Flexible Limits**: Per-endpoint, tier-based, geographic, and time-based limiting
-- ✅ **Observability**: Prometheus metrics + Grafana dashboards
-- ✅ **High Availability**: Redis failover handling and circuit breakers
-- ✅ **Admin API**: Real-time limit management and monitoring
-
-## 🏗️ Architecture
-
-### Core Interfaces
-
-```go
-// RateLimiter is the primary interface for rate limiting operations
-type RateLimiter interface {
-    Allow(key string) (bool, *LimitInfo, error)
-    AllowN(key string, n int) (bool, *LimitInfo, error)
-    Reset(key string) error
-}
-
-// LimitInfo provides detailed information about rate limit status
-type LimitInfo struct {
-    Limit      int
-    Remaining  int
-    ResetAt    time.Time
-    RetryAfter *time.Duration
-}
-
-// Store abstracts the persistence layer (Redis, in-memory, etc.)
-type Store interface {
-    Increment(key string, window time.Time) (int64, error)
-    GetWindows(key string, from, to time.Time) ([]Window, error)
-    SetTokens(key string, tokens float64, lastRefill time.Time) error
-}
-```
-
-### System Components
-
-```
-┌─────────────┐      ┌──────────────┐      ┌─────────────┐
-│   Client    │─────▶│ Rate Limiter │─────▶│    Redis    │
-│ Application │      │   Service    │      │   Cluster   │
-└─────────────┘      └──────────────┘      └─────────────┘
-                            │
-                            ▼
-                     ┌──────────────┐
-                     │  Prometheus  │
-                     │  + Grafana   │
-                     └──────────────┘
-```
-
-## 🛠️ Tech Stack
-
-| Component | Technology |
-|-----------|------------|
-| **Language** | Go 1.23+ |
-| **Distributed State** | Redis (with Lua scripts) |
-| **Configuration Store** | PostgreSQL |
-| **HTTP Framework** | Gin / Fiber |
-| **Metrics** | Prometheus |
-| **Visualization** | Grafana |
-| **Load Testing** | Vegeta |
-
-## 📁 Project Structure
-
-```
-rate-limiter/
-├── cmd/
-│   └── server/
-│       └── main.go                 # Application entry point
-├── internal/
-│   ├── algorithms/                 # Rate limiting algorithms
-│   │   ├── token_bucket.go
-│   │   ├── sliding_window.go
-│   │   └── fixed_window.go
-│   ├── store/                      # Storage backends
-│   │   ├── redis.go
-│   │   └── memory.go
-│   ├── config/                     # Configuration management
-│   │   └── config.go
-│   ├── handlers/                   # HTTP handlers
-│   │   └── rate_limit.go
-│   └── metrics/                    # Metrics collection
-│       └── prometheus.go
-├── pkg/
-│   └── limiter/                    # Client SDK
-│       └── client.go
-├── scripts/
-│   ├── load-test.sh               # Load testing utilities
-│   └── benchmark.go               # Benchmark suite
-├── docker/
-│   └── docker-compose.yml         # Local development environment
-└── tests/
-    ├── unit/                      # Unit tests
-    ├── integration/               # Integration tests
-    └── benchmark/                 # Performance benchmarks
-```
-
-## 🔌 HTTP API
-
-### Endpoints
-
-```
-POST   /v1/check          # Check if request is allowed
-GET    /v1/status/:key    # Get current limit status
-POST   /v1/reset/:key     # Reset limits (admin)
-PUT    /v1/config         # Update limits dynamically
-GET    /v1/metrics        # Prometheus metrics endpoint
-GET    /health            # Health check
-```
-
-### Response Headers
-
-All rate-limited responses include standard headers:
-
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 45
-X-RateLimit-Reset: 1609459200
-Retry-After: 30
-```
-
-### Example Request
+## Quick start
 
 ```bash
-curl -X POST http://localhost:8080/v1/check \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "resource": "api.users.create",
-    "identifier": "user-123"
-  }'
+# Run directly (in-memory store, config.yaml optional)
+go run ./cmd/server
+
+# Or run the full stack: service + Redis + Prometheus + Grafana
+make docker-up
 ```
 
-### Example Response
+Check a request:
+
+```bash
+curl -s -X POST http://localhost:8080/v1/check \
+  -H 'Content-Type: application/json' \
+  -d '{"resource": "api.users.create", "identifier": "user-123"}'
+```
 
 ```json
 {
   "allowed": true,
-  "limit": 100,
-  "remaining": 45,
-  "reset_at": "2024-01-01T12:00:00Z",
-  "retry_after": null
+  "limit": 120,
+  "remaining": 119,
+  "reset_at": "2026-07-15T17:32:47Z"
 }
 ```
 
-## 🚀 Getting Started
+When the budget is spent the service answers `429` with a `Retry-After` header and the same JSON shape plus `retry_after` (seconds, rounded up).
 
-### Prerequisites
+> With the Compose stack the service listens on **:8081**, Prometheus on :9090, Grafana on :3000 (admin/admin).
 
-- Go 1.23 or higher
-- Docker and Docker Compose (for local development)
-- Redis 6.0+ (optional for local development)
+## API
 
-### Quick Start
+| Method | Path              | Purpose                                                        |
+|--------|-------------------|----------------------------------------------------------------|
+| `POST` | `/v1/check`       | Decide and consume: may `identifier` access `resource` now?    |
+| `GET`  | `/v1/status/:key` | Current state for `identifier:resource` — never consumes       |
+| `POST` | `/v1/reset/:key`  | Clear state for one key (operational/admin use)                |
+| `GET`  | `/health`         | `200` when the store answers, `503` otherwise                  |
+| `GET`  | `/metrics`        | Prometheus metrics                                             |
 
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/go-rate-limiter.git
-cd go-rate-limiter
+### `POST /v1/check`
 
-# Start dependencies with Docker Compose
-docker-compose -f docker/docker-compose.yml up -d
-
-# Build the service
-go build -o bin/rate-limiter cmd/server/main.go
-
-# Run the service
-./bin/rate-limiter
-
-# Or run directly
-go run cmd/server/main.go
+```json
+{
+  "resource":   "api.users.create",   // required — what is being accessed
+  "identifier": "user-123",           // required — who is accessing it
+  "algorithm":  "sliding_window",     // optional — override the default
+  "tier":       "premium",            // optional — use a configured tier's limits
+  "count":      3                     // optional — consume several permits at once (default 1)
+}
 ```
 
-### Configuration
+`count` is all-or-nothing: either all permits are granted or none are, and a denied request consumes nothing. A `count` that exceeds the configured limit can never succeed and is rejected with `400` rather than `429`.
 
-Create a `config.yaml` file:
+Every decision carries the standard headers:
+
+```http
+X-RateLimit-Limit: 120
+X-RateLimit-Remaining: 117
+X-RateLimit-Reset: 1783532167
+Retry-After: 12          (only on 429)
+```
+
+### Status and reset
+
+`/v1/status` and `/v1/reset` take the same `identifier:resource` pair as the path key, with `algorithm` and `tier` as query parameters:
+
+```bash
+curl -s 'http://localhost:8080/v1/status/user-123:api.users.create?algorithm=token_bucket'
+curl -s -X POST 'http://localhost:8080/v1/reset/user-123:api.users.create'
+```
+
+Status is a true read: it reports `remaining` without consuming permits.
+
+## Algorithms
+
+| Algorithm        | Behaviour                                                                 | Trade-off                                                       |
+|------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------|
+| `token_bucket`   | Refills continuously at `requests/window`; bursts up to `burst`           | Best for smoothing traffic while tolerating short spikes        |
+| `sliding_window` | Weights the previous window by its remaining overlap: `cur + prev×w`      | Near-accurate limiting with two counters per key                |
+| `fixed_window`   | One counter per window                                                     | Cheapest, but admits up to 2× the limit across a window boundary |
+
+The default algorithm is set in config; each request may override it. The three algorithms keep separate state, so switching algorithms never inherits stale counts.
+
+## Configuration
+
+`config.yaml` (all keys optional — built-in defaults apply):
 
 ```yaml
 server:
@@ -250,244 +106,82 @@ server:
   read_timeout: 5s
   write_timeout: 10s
 
+store: memory            # memory | redis
+
 redis:
-  addresses:
-    - localhost:6379
-  password: ""
-  db: 0
+  addresses: [localhost:6379]
   pool_size: 100
 
 algorithms:
-  default: token_bucket
+  default: token_bucket  # token_bucket | sliding_window | fixed_window
 
 limits:
   default:
-    requests: 100
+    requests: 100        # permits per window
     window: 1m
-
+    burst: 120           # token-bucket capacity (defaults to requests)
   tiers:
-    free:
-      requests: 100
-      window: 1h
     premium:
       requests: 10000
       window: 1h
+      burst: 12000
+
+metrics:
+  enabled: true
+  path: /metrics
 ```
 
-## 📊 Performance
+Environment overrides (useful in containers): `PORT`, `STORE`, `REDIS_ADDR` (comma-separated for cluster), `REDIS_PASSWORD`, and `CONFIG_FILE` to point at a different file. A malformed config file fails startup loudly rather than silently falling back to defaults.
 
-### Benchmarks
+## Design notes
 
-Performance targets and actual results:
+**Atomicity lives in the store.** Algorithms are stateless; each decision compiles down to one atomic store operation. The Redis backend runs the entire read-evaluate-increment sequence as a Lua script on the server, so any number of service instances share correct limits without coordination. The in-memory backend takes a per-key mutex — unrelated keys never contend. A concurrency test asserts that 300 parallel requests against a limit of 100 admit *exactly* 100, on both backends.
 
-| Metric | Target | Actual |
-|--------|--------|--------|
-| **Latency (p50)** | < 0.5ms | TBD |
-| **Latency (p99)** | < 1ms | TBD |
-| **Throughput** | 100k req/s | TBD |
-| **Memory Usage** | Minimal | TBD |
+**Clocks.** Redis decisions use the Redis server clock (`TIME` inside the script), making instances with skewed local clocks consistent with each other.
 
-### Running Benchmarks
+**TTLs are derived, not configured.** Window state expires after two windows (when it can no longer influence a decision); bucket state expires after exactly the time a full refill would take, so eviction is indistinguishable from refilling. Idle keys cost nothing in either backend.
+
+**Retry math doesn't truncate.** `retry_after` is computed from the actual refill rate or window overlap with sub-second precision, then rounded *up* to whole seconds for the header — a denied client is never told to retry too early.
+
+**Known limits.** The sliding window is the standard weighted approximation (it assumes requests in the previous window were evenly distributed). The in-memory store is per-instance by design — run Redis when there is more than one instance.
+
+## Performance
+
+`make bench` on a Ryzen 7 5800H (Windows, Go 1.26, in-memory store):
+
+| Benchmark                    | token_bucket | sliding_window | fixed_window |
+|------------------------------|--------------|----------------|--------------|
+| Parallel, 100 keys           | 66 ns/op     | 93 ns/op       | 97 ns/op     |
+| Parallel, single hot key     | 139 ns/op    | 234 ns/op      | 220 ns/op    |
+| Allocations per decision     | 80 B / 3     | 160 B / 4      | 160 B / 4    |
+
+These measure the decision path (algorithm + store); end-to-end HTTP latency is dominated by the network and, for the Redis backend, one round trip per decision.
+
+There is also a [vegeta](https://github.com/tsenart/vegeta) script for load-testing a running instance: `./scripts/load-test.sh`.
+
+## Development
 
 ```bash
-# Run Go benchmarks
-go test -bench=. -benchmem ./...
-
-# Run load tests with Vegeta
-./scripts/load-test.sh
-
-# Profile with pprof
-go test -cpuprofile=cpu.prof -memprofile=mem.prof -bench=.
-go tool pprof cpu.prof
+make test           # unit + handler tests, race detector
+make bench          # algorithm benchmarks
+make docker-up      # full stack with provisioned Grafana dashboard
 ```
 
-### Benchmark Suite
+The Redis integration tests run automatically when `REDIS_ADDR` is set and skip otherwise; CI runs them against a Redis service container, along with `gofmt`, `go vet`, the race detector, and a Docker image smoke test.
 
-```go
-// Algorithm benchmarks
-func BenchmarkTokenBucket(b *testing.B)
-func BenchmarkSlidingWindow(b *testing.B)
-func BenchmarkFixedWindow(b *testing.B)
-func BenchmarkConcurrentAccess(b *testing.B)
+### Project layout
 
-// Load test scenarios
-// - Steady load
-// - Burst traffic
-// - Distributed clients
-// - Configuration changes under load
+```
+cmd/server/          entry point, wiring
+internal/algorithms/ token bucket, sliding window, fixed window
+internal/store/      memory and Redis backends (atomic ops, Lua scripts)
+internal/handlers/   HTTP API
+internal/config/     YAML config, env overrides, validation
+internal/metrics/    Prometheus collectors
+pkg/limiter/         core interfaces shared by the above
+docker/              Dockerfile, Compose stack, Prometheus & Grafana provisioning
 ```
 
-## 🔧 Implementation Roadmap
+## License
 
-### Phase 1: Core Algorithm ✅
-- [x] Token Bucket implementation
-- [x] In-memory store
-- [x] Basic HTTP endpoint
-- [x] Unit tests
-
-### Phase 2: Redis Integration 🚧
-- [ ] Implement Redis store
-- [ ] Lua scripts for atomic operations
-- [ ] Connection pooling
-- [ ] Failover handling
-
-### Phase 3: Performance Optimization 📋
-- [ ] Benchmark with pprof
-- [ ] Optimize allocations
-- [ ] Add caching layer
-- [ ] Implement batching
-
-### Phase 4: Production Features 📋
-- [ ] Prometheus metrics
-- [ ] Grafana dashboards
-- [ ] Configuration hot reload
-- [ ] Admin API
-- [ ] Client SDK
-
-## 🎓 Performance Optimizations
-
-### Go-Specific Optimizations
-
-1. **Object Pooling**: Use `sync.Pool` for frequently allocated objects
-2. **Avoid Allocations**: Use arrays over slices in hot paths
-3. **Atomic Operations**: Leverage `sync/atomic` for lock-free operations
-4. **Efficient Serialization**: Minimize marshaling overhead
-5. **Regular Profiling**: Use `pprof` to identify bottlenecks
-
-### Redis Optimizations
-
-- **Lua Scripts**: Ensure atomic operations without round trips
-- **Pipelining**: Batch commands to reduce network latency
-- **Connection Pooling**: Reuse connections efficiently
-- **Redis Cluster**: Horizontal scaling for high throughput
-- **Circuit Breaker**: Graceful degradation on Redis failures
-
-### Example Optimization
-
-```go
-// Bad: Allocates on every call
-func (l *Limiter) Allow(key string) bool {
-    info := &LimitInfo{} // heap allocation
-    // ...
-}
-
-// Good: Use sync.Pool
-var limitInfoPool = sync.Pool{
-    New: func() interface{} {
-        return &LimitInfo{}
-    },
-}
-
-func (l *Limiter) Allow(key string) bool {
-    info := limitInfoPool.Get().(*LimitInfo)
-    defer limitInfoPool.Put(info)
-    // ...
-}
-```
-
-## ⚠️ Common Pitfalls
-
-- ❌ **Don't** use floats for token calculations (precision issues)
-- ❌ **Don't** ignore Redis connection failures (implement fallbacks)
-- ❌ **Don't** block on Redis calls (use context with timeouts)
-- ❌ **Don't** ignore time synchronization in distributed systems
-- ❌ **Don't** forget to expire old keys in Redis (memory leaks)
-
-✅ **Do** use int64 for precise calculations
-✅ **Do** implement circuit breakers
-✅ **Do** use context deadlines
-✅ **Do** use NTP or similar for time sync
-✅ **Do** set TTL on all Redis keys
-
-## 🧪 Testing
-
-### Test Coverage
-
-```bash
-# Run all tests
-go test ./...
-
-# Run with coverage
-go test -cover ./...
-
-# Generate coverage report
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-```
-
-### Test Types
-
-- **Unit Tests**: Each algorithm and component
-- **Integration Tests**: Redis and PostgreSQL interactions
-- **Benchmark Tests**: Performance validation
-- **Chaos Tests**: Redis failure, network partition, time drift
-- **Load Tests**: Vegeta with visual graphs
-
-## 📈 Monitoring
-
-### Prometheus Metrics
-
-Key metrics exposed:
-
-- `rate_limiter_requests_total`: Total requests processed
-- `rate_limiter_requests_allowed`: Requests allowed
-- `rate_limiter_requests_denied`: Requests denied
-- `rate_limiter_latency_seconds`: Request latency histogram
-- `rate_limiter_redis_errors_total`: Redis operation errors
-
-### Grafana Dashboards
-
-Pre-built dashboards for:
-- Request throughput and success rates
-- Latency percentiles (p50, p95, p99)
-- Algorithm performance comparison
-- Redis health and performance
-- Error rates and types
-
-## 📚 Documentation
-
-- [Architecture Decisions](docs/architecture.md) - Design choices and trade-offs
-- [Algorithm Deep Dive](docs/algorithms.md) - Detailed algorithm explanations
-- [Deployment Guide](docs/deployment.md) - Production deployment best practices
-- [API Reference](docs/api.md) - Complete API documentation
-- [Client SDK Guide](docs/client-sdk.md) - Using the Go client library
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
-
-### Development Setup
-
-```bash
-# Install dependencies
-go mod download
-
-# Run tests
-make test
-
-# Run linters
-make lint
-
-# Format code
-make fmt
-```
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Inspired by production rate limiters at scale (Stripe, GitHub, Cloudflare)
-- Algorithm implementations based on industry best practices
-- Community contributions and feedback
-
-## 📞 Support
-
-- 📧 Email: support@example.com
-- 💬 Discord: [Join our community](https://discord.gg/example)
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/go-rate-limiter/issues)
-
----
-
-**Built with ❤️ in Go**
+[MIT](LICENSE)
